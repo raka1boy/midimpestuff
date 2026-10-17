@@ -23,16 +23,27 @@ keep pressure and timbre on released notes so their tails keep their expression 
 A non mpe controllers are also supported for ji.
 
 --reprompt-midi chooses the midi ports again and save the new choice
+
 --reset-flags ignores the flags saved from the last run and start from the built-in defaults
+
 --send-mcm at startup sends the mpe Configuration Message (lower zone, 15 member channels)
---bend-range SEMITONES sets the pitch bend range of channels 2–16. --ji also uses this value to convert cents to bend. default is 48. --no-bend-range stops sending it
---no-steal when all 15 channels are busy drop new notes instead of stealing the oldest one. --steal turns stealing back on.
+
+--bend-range SEMITONES sets the pitch bend range of channels 2–16. --ji also uses this value to convert cents to bend. default is 48
+
+--no-steal when all 15 channels are busy drop new notes instead of stealing the oldest one. --steal turns stealing back on
+
 --pbscale 0.0-1.0 scales incoming pitch bend by this factor. default is 1
+
 --ji PRIME retune notes played together to just intonation, building ratios from primes up to PRIME (3 = pythagorean, 5, 7, 11, 13 etc). default is 5
+
 --ji-tolerance CENTS with --ji only uses ratios within this many cents of the key played. default = 35
+
 --preserve-pressure SMOOTHING keeps sending pressure to a channel after its note is released until the channel is reused. pressure is smoothed by 0.0–1.0 (default 0.5) so that lifting a finger doesn't drop the channel straight to zero. 0 = no smoothing
+
 --preserve-timbre keeps sending timbre to a channel after its note is released until the channel is reused
+
 --unipolar-timbre makes timbre positive-only. the distance from the centre (64) in either direction is scaled to 0–127 so the centre sends 0
+
 -v, --verbose prints channel assignments, js tunings and just stuff in general
 
 with --ji every time a note starts the tool finds a just tuning for all the notes being held and retunes them with per-note pitch bend.
