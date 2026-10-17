@@ -26,6 +26,7 @@ CHANNEL_MODE_CCS = set(range(120, 128))
 TIMBRE_CC = 74
 
 CONFIG_PATH = Path(__file__).resolve().with_suffix('.json')
+UNSAVED_FLAGS = {'help', 'reprompt_midi', 'reset_flags'}
 
 JI_TOLERANCE = 35.0
 JI_PER_STEP = 4
@@ -141,9 +142,10 @@ def ji_tuning(pcs, bass, limit, tolerance=JI_TOLERANCE):
 
 class MpeDistributor:
     def __init__(self, send, steal=True, verbose=False, ji_limit=None, ji_tolerance=JI_TOLERANCE,
-                 bend_range=48, pb_scale=1.0, preserve=(), pressure_smoothing=0.0):
+                 bend_range=48, pb_scale=1.0, preserve=(), pressure_smoothing=0.0, unipolar_timbre=False):
         self.send = send
         self.preserve = set(preserve)
+        self.unipolar_timbre = unipolar_timbre
         self.pressure_smoothing = pressure_smoothing
         self.steal = steal
         self.verbose = verbose
@@ -247,6 +249,9 @@ class MpeDistributor:
         in_ch = msg.channel
         source = (port, in_ch)
         t = msg.type
+
+        if self.unipolar_timbre and t == 'control_change' and msg.control == TIMBRE_CC:
+            msg = msg.copy(value=min(127, abs(msg.value - 64) * 2))
 
         if t == 'note_on' and msg.velocity > 0:
             out_ch = self._allocate()
@@ -407,24 +412,47 @@ def load_config():
     try:
         with open(CONFIG_PATH, encoding='utf-8') as f:
             cfg = json.load(f)
-        return cfg['inputs'], cfg['output']
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+    except (OSError, ValueError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
-def save_config(inputs, output):
+def save_config(**updates):
+    cfg = load_config()
+    cfg.update(updates)
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump({'inputs': inputs, 'output': output}, f, indent=2)
-    print(f"saved midi selection to {CONFIG_PATH}")
+        json.dump(cfg, f, indent=2)
+
+
+def apply_saved_flags(ap, saved):
+    if not isinstance(saved, dict):
+        return
+    defaults, seen = {}, set(UNSAVED_FLAGS)
+    for action in ap._actions:
+        if action.dest not in saved or action.dest in seen:
+            continue
+        seen.add(action.dest)
+        value = saved[action.dest]
+        try:
+            if isinstance(action.default, bool) and not isinstance(value, bool):
+                raise ValueError
+            if value is not None and action.type:
+                value = action.type(str(value))
+        except (argparse.ArgumentTypeError, ValueError):
+            print(f"ignoring saved {action.dest} = {value!r}, it's not valid")
+            continue
+        defaults[action.dest] = value
+    ap.set_defaults(**defaults)
 
 
 def choose_ports(reprompt):
     in_names = mido.get_input_names()
     out_names = mido.get_output_names()
 
-    saved = None if reprompt else load_config()
-    if saved:
-        saved_ins, saved_out = saved
+    cfg = {} if reprompt else load_config()
+    saved_ins, saved_out = cfg.get('inputs'), cfg.get('output')
+    if (isinstance(saved_ins, list) and all(isinstance(s, str) for s in saved_ins)
+            and isinstance(saved_out, str)):
         ins = [p for p in (find_port(s, in_names) for s in saved_ins) if p]
         out = find_port(saved_out, out_names)
         for s in saved_ins:
@@ -435,7 +463,8 @@ def choose_ports(reprompt):
         print("the saved midi ports aren't available, choose again or plug the devices in and restart")
 
     ins, out = prompt_ports(in_names, out_names)
-    save_config(ins, out)
+    save_config(inputs=ins, output=out)
+    print(f"saved midi selection to {CONFIG_PATH}")
     return ins, out
 
 
@@ -443,18 +472,23 @@ def main():
     ap = argparse.ArgumentParser(description="Spread midi across mpe channels.")
     ap.add_argument('--reprompt-midi', action='store_true',
                     help="choose the midi ports again and save the new choice")
-    ap.add_argument('--send-mcm', action='store_true',
+    ap.add_argument('--reset-flags', action='store_true',
+                    help="ignore the flags saved from the last run and start from the built-in defaults")
+    ap.add_argument('--send-mcm', action=argparse.BooleanOptionalAction, default=False,
                     help="at startup, send mpe configuration Message (lower zone, 15 member channels)")
     ap.add_argument('--bend-range', type=int, metavar='SEMITONES',
                     help="at startup, set pitch bend range of member channels 2-16, default = 48"
                          "--ji also uses it to convert cents to pitch bend")
-    ap.add_argument('--no-steal', action='store_true',
-                    help="drop new notes when all 15 channels are busy default = steal the oldest note")
-    ap.add_argument('--ji', action='store_true',
-                    help="retune notes played together to pure ji intervals with per-note pitch bend")
-    ap.add_argument('--ji-limit', type=ji_limit_int, default=5, metavar='PRIME',
-                    help="with --ji: use ratios built from primes up to this one"
-                         "(3 = pythagorean, 5, 7, 11, 13 etc). default = 5")
+    ap.add_argument('--no-bend-range', dest='bend_range', action='store_const', const=None,
+                    help="don't set the pitch bend range at startup")
+    ap.add_argument('--steal', action=argparse.BooleanOptionalAction, default=True,
+                    help="steal the oldest note when all 15 channels are busy, --no-steal drops new notes instead")
+    ap.add_argument('--ji', type=ji_limit_int, nargs='?', const=5, metavar='PRIME',
+                    help="retune notes played together to pure ji intervals with per-note pitch bend, "
+                         "using ratios built from primes up to PRIME (3 = pythagorean, 5, 7, 11, 13 etc). "
+                         "default = 5")
+    ap.add_argument('--no-ji', dest='ji', action='store_const', const=None,
+                    help="turn ji retuning off")
     ap.add_argument('--ji-tolerance', type=cents_tolerance, default=JI_TOLERANCE, metavar='CENTS',
                     help="with --ji: only use ratios within this many cents of the key played"
                          f"default = {JI_TOLERANCE:g}")
@@ -464,22 +498,33 @@ def main():
                     help="keep sending pressure to a channel after its note is released, until the channel is reused. "
                          "pressure is smoothed by smoothing 0.0-1.0 and default = 0.5 so a lifted finger "
                          "leaves the channel with a non-zero pressure. 0 = no smoothing")
-    ap.add_argument('--preserve-timbre', action='store_true',
+    ap.add_argument('--no-preserve-pressure', dest='preserve_pressure', action='store_const', const=None,
+                    help="stop sending pressure to channels after their note is released")
+    ap.add_argument('--preserve-timbre', action=argparse.BooleanOptionalAction, default=False,
                     help=f"keep sending timbre cc to a channel after its note is released, "
                          "until the channel is reused")
-    ap.add_argument('-v', '--verbose', action='store_true', help="print each channel assignment and just more stuff in general")
+    ap.add_argument('--unipolar-timbre', action=argparse.BooleanOptionalAction, default=False,
+                    help="make timbre cc positive-only. distance from the centre =64 in either direction "
+                         "is scaled to 0-127, so the centre sends 0")
+    ap.add_argument('-v', '--verbose', action=argparse.BooleanOptionalAction, default=False,
+                    help="print each channel assignment and just more stuff in general")
+
+    if '--reset-flags' not in sys.argv[1:]:
+        apply_saved_flags(ap, load_config().get('flags'))
     args = ap.parse_args()
 
     if args.ji:
         try:
-            table = ji_ratios(args.ji_limit, args.ji_tolerance)
+            table = ji_ratios(args.ji, args.ji_tolerance)
         except ValueError as e:
-            sys.exit(f"{e}. raise ji-tolerance or ji-limit")
+            sys.exit(f"{e}. raise --ji-tolerance or the --ji limit")
         if args.verbose:
-            print(f"{args.ji_limit}-limit ratios:")
+            print(f"{args.ji}-limit ratios:")
             for step, rs in table.items():
                 print(f"{step:2}: " + ", ".join(
                     f"{r} ({1200 * math.log2(r) - 100 * step:+.1f}c)" for r in rs))
+
+    save_config(flags={k: v for k, v in vars(args).items() if k not in UNSAVED_FLAGS})
 
     try:
         in_names, out_name = choose_ports(args.reprompt_midi)
@@ -498,11 +543,12 @@ def main():
         bend_range = args.bend_range or 48
         preserve_pressure = args.preserve_pressure is not None
         preserve = ['aftertouch'] * preserve_pressure + [('cc', TIMBRE_CC)] * args.preserve_timbre
-        dist = MpeDistributor(send, steal=not args.no_steal, verbose=args.verbose,
-                              ji_limit=args.ji_limit if args.ji else None,
+        dist = MpeDistributor(send, steal=args.steal, verbose=args.verbose,
+                              ji_limit=args.ji,
                               ji_tolerance=args.ji_tolerance, bend_range=bend_range, pb_scale=args.pbscale,
                               preserve=preserve,
-                              pressure_smoothing=args.preserve_pressure if preserve_pressure else 0.0)
+                              pressure_smoothing=args.preserve_pressure if preserve_pressure else 0.0,
+                              unipolar_timbre=args.unipolar_timbre)
 
         for name in in_names:
             stack.enter_context(mido.open_input(
