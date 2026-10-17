@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import functools
+import heapq
 import itertools
 import json
 import math
@@ -25,14 +26,11 @@ CHANNEL_MODE_CCS = set(range(120, 128))
 
 CONFIG_PATH = Path(__file__).resolve().with_suffix('.json')
 
-JI_RATIOS = {5: {
-    0: (F(1),), 1: (F(16, 15),), 2: (F(9, 8), F(10, 9)), 3: (F(6, 5),),
-    4: (F(5, 4),), 5: (F(4, 3),), 6: (F(45, 32), F(64, 45)), 7: (F(3, 2),),
-    8: (F(8, 5),), 9: (F(5, 3),), 10: (F(9, 5), F(16, 9)), 11: (F(15, 8),),
-}}
-JI_RATIOS[7] = {**JI_RATIOS[5],
-                6: JI_RATIOS[5][6] + (F(7, 5), F(10, 7)),
-                10: JI_RATIOS[5][10] + (F(7, 4),)}
+JI_TOLERANCE = 35.0
+JI_PER_STEP = 4
+JI_SLACK = 3.0
+JI_MAX_HEIGHT = 2 ** 24
+
 
 def _odd_part(n):
     while n % 2 == 0:
@@ -44,31 +42,111 @@ def _complexity(ratio):
     return math.log2(_odd_part(ratio.numerator) * _odd_part(ratio.denominator))
 
 
+def _odd_primes(limit):
+    return [p for p in range(3, limit + 1, 2)
+            if all(p % q for q in range(3, math.isqrt(p) + 1, 2))]
+
+
+def _octave_reduce(ratio):
+    ratio *= F(2) ** (ratio.denominator.bit_length() - ratio.numerator.bit_length())
+    return ratio * 2 if ratio < 1 else ratio
+
+
+@functools.lru_cache(maxsize=None)
+def ji_ratios(limit, tolerance=JI_TOLERANCE):
+    primes = _odd_primes(limit)
+    found = {step: [] for step in range(1, 12)}
+    heap, seen = [1], {1}
+    while heap:
+        m = heapq.heappop(heap)
+        height = math.log2(m)
+        if m > JI_MAX_HEIGHT or all(len(v) >= JI_PER_STEP or (v and height > v[0][1] + JI_SLACK)
+                                    for v in found.values()):
+            break
+        for p in primes:
+            if m * p not in seen:
+                seen.add(m * p)
+                heapq.heappush(heap, m * p)
+        powers = []
+        for p in primes:
+            pe = 1
+            while m % (pe * p) == 0:
+                pe *= p
+            if pe > 1:
+                powers.append(pe)
+        for split in itertools.product((False, True), repeat=len(powers)):
+            num = math.prod(pe for pe, up in zip(powers, split) if up)
+            ratio = _octave_reduce(F(num, m // num))
+            cents = 1200 * math.log2(ratio)
+            step = round(cents / 100)
+            v = found.get(step)
+            if (v is not None and abs(cents - 100 * step) <= tolerance and len(v) < JI_PER_STEP
+                    and (not v or height <= v[0][1] + JI_SLACK)):
+                v.append((ratio, height))
+    for step, v in found.items():
+        if not v:
+            raise ValueError(f"no {limit}-limit ratio within {tolerance:g} cents of {step} semitones")
+    return {0: (F(1),), **{step: tuple(r for r, _ in v) for step, v in found.items()}}
+
+
+@functools.lru_cache(maxsize=None)
+def _ji_space(limit, tolerance):
+    table = ji_ratios(limit, tolerance)
+    ratios = sorted({r for rs in table.values() for r in rs})
+    index = {r: i for i, r in enumerate(ratios)}
+    dist = [[_complexity(b / a) for b in ratios] for a in ratios]
+    return ratios, {step: [index[r] for r in rs] for step, rs in table.items()}, dist
+
+
 @functools.lru_cache(maxsize=4096)
-def ji_tuning(pcs, bass, limit):
+def ji_tuning(pcs, bass, limit, tolerance=JI_TOLERANCE):
+    ratios, table, dist = _ji_space(limit, tolerance)
     pcs = sorted(pcs)
-    table = JI_RATIOS[limit]
-    pairs = list(itertools.combinations(pcs, 2))
     best_score, best_cents = None, None
+
     for root in pcs:
         steps = {pc: (pc - root) % 12 for pc in pcs}
-        for combo in itertools.product(*(table[steps[pc]] for pc in pcs)):
-            ratio = dict(zip(pcs, combo))
-            complexity = sum(_complexity(ratio[b] / ratio[a]) for a, b in pairs)
-            cents = {pc: 1200 * math.log2(ratio[pc]) - 100 * steps[pc] for pc in pcs}
-            score = (round(complexity, 6), root != bass, sum(map(abs, cents.values())))
-            if best_score is None or score < best_score:
-                best_score, best_cents = score, cents
+        order = sorted(pcs, key=lambda pc: len(table[steps[pc]]))
+        cands = [table[steps[pc]] for pc in order]
+        n = len(order)
+        # cheapest possible interval between each pair of notes, to bound the pairs not yet chosen
+        floor = [[min(dist[a][b] for a in cands[i] for b in cands[j]) for j in range(n)]
+                 for i in range(n)]
+        tail = [sum(floor[i][j] for i in range(k, n) for j in range(i + 1, n)) for k in range(n + 1)]
+        chosen = [0] * n
+
+        def search(i, cost, rest):
+            nonlocal best_score, best_cents
+            if i == n:
+                cents = {pc: 1200 * math.log2(ratios[c]) - 100 * steps[pc]
+                         for pc, c in zip(order, chosen)}
+                score = (round(cost, 6), root != bass, sum(map(abs, cents.values())))
+                if best_score is None or score < best_score:
+                    best_score, best_cents = score, cents
+                return
+            if best_score and round(cost + sum(map(min, rest)) + tail[i], 6) > best_score[0]:
+                return
+            for c, extra in sorted(zip(cands[i], rest[0]), key=lambda x: x[1]):
+                chosen[i] = c
+                row = dist[c]
+                search(i + 1, cost + extra,
+                       [[acc + row[b] for acc, b in zip(r, cands[k])]
+                        for k, r in enumerate(rest[1:], i + 1)])
+
+        search(0, 0.0, [[0.0] * len(c) for c in cands])
+
     mean = sum(best_cents.values()) / len(best_cents)
     return {pc: c - mean for pc, c in best_cents.items()}
 
 
 class MpeDistributor:
-    def __init__(self, send, steal=True, verbose=False, ji_limit=None, bend_range=48, pb_scale=1.0):
+    def __init__(self, send, steal=True, verbose=False, ji_limit=None, ji_tolerance=JI_TOLERANCE,
+                 bend_range=48, pb_scale=1.0):
         self.send = send
         self.steal = steal
         self.verbose = verbose
         self.ji_limit = ji_limit
+        self.ji_tolerance = ji_tolerance
         self.bend_range = bend_range
         self.pb_scale = pb_scale
         self.lock = threading.Lock()
@@ -135,7 +213,7 @@ class MpeDistributor:
         if len(held) < 2:
             return
         tuning = ji_tuning(frozenset(n % 12 for n in held.values()),
-                           min(held.values()) % 12, self.ji_limit)
+                           min(held.values()) % 12, self.ji_limit, self.ji_tolerance)
         for ch, note in held.items():
             cents = tuning[note % 12]
             changed = self.ji_cents.get(ch) != cents
@@ -234,12 +312,32 @@ def unit_float(text):
     return value
 
 
+def ji_limit_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' is not a whole number")
+    if value < 3:
+        raise argparse.ArgumentTypeError(f"{value} is below 3, the smallest useful limit")
+    return value
+
+
+def cents_tolerance(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' is not a number")
+    if not 0.0 < value <= 50.0:
+        raise argparse.ArgumentTypeError(f"{value} is not above 0 and at most 50")
+    return value
+
+
 def ask_numbers(prompt, count, multiple):
     while True:
         try:
             text = input(prompt).strip()
         except EOFError:
-            sys.exit("\nNo selection made.")
+            sys.exit("\nno selection made")
         parts = [p for p in re.split(r'[\s,]+', text) if p]
         if not parts:
             continue
@@ -295,7 +393,7 @@ def load_config():
 def save_config(inputs, output):
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         json.dump({'inputs': inputs, 'output': output}, f, indent=2)
-    print(f"Saved midi selection to {CONFIG_PATH}")
+    print(f"saved midi selection to {CONFIG_PATH}")
 
 
 def choose_ports(reprompt):
@@ -332,12 +430,27 @@ def main():
                     help="drop new notes when all 15 channels are busy default = steal the oldest note")
     ap.add_argument('--ji', action='store_true',
                     help="retune notes played together to pure ji intervals with per-note pitch bend")
-    ap.add_argument('--ji-limit', type=int, choices=(5, 7), default=5,
-                    help="with --ji: 5 = 5-limit ratios, 7 = also allow 7/4, 7/5, 10/7")
+    ap.add_argument('--ji-limit', type=ji_limit_int, default=5, metavar='PRIME',
+                    help="with --ji: use ratios built from primes up to this one"
+                         "(3 = pythagorean, 5, 7, 11, 13 etc). default = 5")
+    ap.add_argument('--ji-tolerance', type=cents_tolerance, default=JI_TOLERANCE, metavar='CENTS',
+                    help="with --ji: only use ratios within this many cents of the key played"
+                         f"default = {JI_TOLERANCE:g}")
     ap.add_argument('--pbscale', type=unit_float, default=1.0, metavar='0.0-1.0',
                     help="scale the controller's pitch bend by this factor. default = 1")
-    ap.add_argument('-v', '--verbose', action='store_true', help="print each channel assignment")
+    ap.add_argument('-v', '--verbose', action='store_true', help="print each channel assignment and just more stuff in general")
     args = ap.parse_args()
+
+    if args.ji:
+        try:
+            table = ji_ratios(args.ji_limit, args.ji_tolerance)
+        except ValueError as e:
+            sys.exit(f"{e}. raise ji-tolerance or ji-limit")
+        if args.verbose:
+            print(f"{args.ji_limit}-limit ratios:")
+            for step, rs in table.items():
+                print(f"{step:2}: " + ", ".join(
+                    f"{r} ({1200 * math.log2(r) - 100 * step:+.1f}c)" for r in rs))
 
     try:
         in_names, out_name = choose_ports(args.reprompt_midi)
@@ -356,7 +469,7 @@ def main():
         bend_range = args.bend_range or 48
         dist = MpeDistributor(send, steal=not args.no_steal, verbose=args.verbose,
                               ji_limit=args.ji_limit if args.ji else None,
-                              bend_range=bend_range, pb_scale=args.pbscale)
+                              ji_tolerance=args.ji_tolerance, bend_range=bend_range, pb_scale=args.pbscale)
 
         for name in in_names:
             stack.enter_context(mido.open_input(
