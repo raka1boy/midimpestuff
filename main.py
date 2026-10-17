@@ -141,9 +141,10 @@ def ji_tuning(pcs, bass, limit, tolerance=JI_TOLERANCE):
 
 class MpeDistributor:
     def __init__(self, send, steal=True, verbose=False, ji_limit=None, ji_tolerance=JI_TOLERANCE,
-                 bend_range=48, pb_scale=1.0, preserve=()):
+                 bend_range=48, pb_scale=1.0, preserve=(), pressure_smoothing=0.0):
         self.send = send
         self.preserve = set(preserve)
+        self.pressure_smoothing = pressure_smoothing
         self.steal = steal
         self.verbose = verbose
         self.ji_limit = ji_limit
@@ -157,6 +158,7 @@ class MpeDistributor:
         self.in_state = {}
         self.ji_cents = {}
         self.lingering = {}
+        self.pressure = {}
 
     def _log(self, text):
         if self.verbose:
@@ -201,13 +203,20 @@ class MpeDistributor:
         pitch += round(self.ji_cents.get(out_ch, 0.0) * 8192 / (100 * self.bend_range))
         return mido.Message('pitchwheel', channel=out_ch, pitch=max(-8192, min(8191, pitch)))
 
+    def _send_pressure(self, out_ch, value):
+        prev = self.pressure.get(out_ch)
+        if prev is not None:
+            value = prev * self.pressure_smoothing + value * (1 - self.pressure_smoothing)
+        self.pressure[out_ch] = value
+        self.send(mido.Message('aftertouch', channel=out_ch, value=round(value)))
+
     def _prime_channel(self, out_ch, source):
         state = self.in_state.get(source, {})
         self.send(self._bend_msg(out_ch, source))
-        if 'aftertouch' not in state:
-            self.send(mido.Message('aftertouch', channel=out_ch, value=0))
+        self.pressure.pop(out_ch, None)
+        self._send_pressure(out_ch, state['aftertouch'].value if 'aftertouch' in state else 0)
         for key, msg in state.items():
-            if key != 'pitchwheel':
+            if key not in ('pitchwheel', 'aftertouch'):
                 self.send(msg.copy(channel=out_ch))
 
     def _retune(self, new_ch):
@@ -266,7 +275,7 @@ class MpeDistributor:
 
         if t == 'polytouch':
             for out_ch in self.note_channels.get((source, msg.note), []):
-                self.send(mido.Message('aftertouch', channel=out_ch, value=msg.value))
+                self._send_pressure(out_ch, msg.value)
             return
 
         if in_ch == MASTER:
@@ -287,8 +296,12 @@ class MpeDistributor:
             if key in self.preserve:
                 targets += [c for c, s in self.lingering.items() if s == source]
             for out_ch in targets:
-                self.send(self._bend_msg(out_ch, source) if t == 'pitchwheel'
-                          else msg.copy(channel=out_ch))
+                if t == 'pitchwheel':
+                    self.send(self._bend_msg(out_ch, source))
+                elif t == 'aftertouch':
+                    self._send_pressure(out_ch, msg.value)
+                else:
+                    self.send(msg.copy(channel=out_ch))
             return
 
         self.send(msg.copy(channel=MASTER))
@@ -301,6 +314,7 @@ class MpeDistributor:
             self.note_channels.clear()
             self.ji_cents.clear()
             self.lingering.clear()
+            self.pressure.clear()
 
 def send_rpn(send, channel, rpn, msb, lsb=0):
     send(mido.Message('control_change', channel=channel, control=101, value=(rpn >> 7) & 0x7F))
@@ -446,8 +460,10 @@ def main():
                          f"default = {JI_TOLERANCE:g}")
     ap.add_argument('--pbscale', type=unit_float, default=1.0, metavar='0.0-1.0',
                     help="scale the controller's pitch bend by this factor. default = 1")
-    ap.add_argument('--preserve-pressure', action='store_true',
-                    help="keep sending pressure to a channel after its note is released, until the channel is reused")
+    ap.add_argument('--preserve-pressure', type=unit_float, nargs='?', const=0.5, metavar='SMOOTHING',
+                    help="keep sending pressure to a channel after its note is released, until the channel is reused. "
+                         "pressure is smoothed by smoothing 0.0-1.0 and default = 0.5 so a lifted finger "
+                         "leaves the channel with a non-zero pressure. 0 = no smoothing")
     ap.add_argument('--preserve-timbre', action='store_true',
                     help=f"keep sending timbre cc to a channel after its note is released, "
                          "until the channel is reused")
@@ -480,11 +496,13 @@ def main():
                 send_rpn(send, ch, 0, args.bend_range) 
 
         bend_range = args.bend_range or 48
-        preserve = ['aftertouch'] * args.preserve_pressure + [('cc', TIMBRE_CC)] * args.preserve_timbre
+        preserve_pressure = args.preserve_pressure is not None
+        preserve = ['aftertouch'] * preserve_pressure + [('cc', TIMBRE_CC)] * args.preserve_timbre
         dist = MpeDistributor(send, steal=not args.no_steal, verbose=args.verbose,
                               ji_limit=args.ji_limit if args.ji else None,
                               ji_tolerance=args.ji_tolerance, bend_range=bend_range, pb_scale=args.pbscale,
-                              preserve=preserve)
+                              preserve=preserve,
+                              pressure_smoothing=args.preserve_pressure if preserve_pressure else 0.0)
 
         for name in in_names:
             stack.enter_context(mido.open_input(
