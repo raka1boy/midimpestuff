@@ -23,6 +23,7 @@ MEMBERS = list(range(1, 16))
 
 RPN_NRPN_CCS = {6, 38, 96, 97, 98, 99, 100, 101}
 CHANNEL_MODE_CCS = set(range(120, 128))
+TIMBRE_CC = 74
 
 CONFIG_PATH = Path(__file__).resolve().with_suffix('.json')
 
@@ -109,7 +110,6 @@ def ji_tuning(pcs, bass, limit, tolerance=JI_TOLERANCE):
         order = sorted(pcs, key=lambda pc: len(table[steps[pc]]))
         cands = [table[steps[pc]] for pc in order]
         n = len(order)
-        # cheapest possible interval between each pair of notes, to bound the pairs not yet chosen
         floor = [[min(dist[a][b] for a in cands[i] for b in cands[j]) for j in range(n)]
                  for i in range(n)]
         tail = [sum(floor[i][j] for i in range(k, n) for j in range(i + 1, n)) for k in range(n + 1)]
@@ -141,8 +141,9 @@ def ji_tuning(pcs, bass, limit, tolerance=JI_TOLERANCE):
 
 class MpeDistributor:
     def __init__(self, send, steal=True, verbose=False, ji_limit=None, ji_tolerance=JI_TOLERANCE,
-                 bend_range=48, pb_scale=1.0):
+                 bend_range=48, pb_scale=1.0, preserve=()):
         self.send = send
+        self.preserve = set(preserve)
         self.steal = steal
         self.verbose = verbose
         self.ji_limit = ji_limit
@@ -155,6 +156,7 @@ class MpeDistributor:
         self.note_channels = {}
         self.in_state = {}
         self.ji_cents = {}
+        self.lingering = {}
 
     def _log(self, text):
         if self.verbose:
@@ -171,7 +173,6 @@ class MpeDistributor:
         if not self.steal:
             return None
 
-        # All channels busy: steal the one holding the oldest note.
         ch = min(self.channel_note, key=lambda c: self.channel_note[c][2])
         source, note, _ = self.channel_note[ch]
         self._log(f"steal ch{ch + 1} (note {note})")
@@ -183,6 +184,8 @@ class MpeDistributor:
     def _release(self, source, note, out_ch):
         self.channel_note.pop(out_ch, None)
         self.ji_cents.pop(out_ch, None)
+        if self.preserve:
+            self.lingering[out_ch] = source
         stack = self.note_channels.get((source, note))
         if stack and out_ch in stack:
             stack.remove(out_ch)
@@ -241,6 +244,7 @@ class MpeDistributor:
             if out_ch is None:
                 self._log(f"drop note {msg.note}, no free channel")
                 return
+            self.lingering.pop(out_ch, None)
             self.channel_note[out_ch] = (source, msg.note, time.monotonic())
             self.note_channels.setdefault((source, msg.note), []).append(out_ch)
             if self.ji_limit:
@@ -279,7 +283,10 @@ class MpeDistributor:
         if t in ('pitchwheel', 'aftertouch', 'control_change'):
             key = ('cc', msg.control) if t == 'control_change' else t
             self.in_state.setdefault(source, {})[key] = msg
-            for out_ch in self._out_channels_for(source):
+            targets = self._out_channels_for(source)
+            if key in self.preserve:
+                targets += [c for c, s in self.lingering.items() if s == source]
+            for out_ch in targets:
                 self.send(self._bend_msg(out_ch, source) if t == 'pitchwheel'
                           else msg.copy(channel=out_ch))
             return
@@ -293,6 +300,7 @@ class MpeDistributor:
             self.channel_note.clear()
             self.note_channels.clear()
             self.ji_cents.clear()
+            self.lingering.clear()
 
 def send_rpn(send, channel, rpn, msb, lsb=0):
     send(mido.Message('control_change', channel=channel, control=101, value=(rpn >> 7) & 0x7F))
@@ -438,6 +446,11 @@ def main():
                          f"default = {JI_TOLERANCE:g}")
     ap.add_argument('--pbscale', type=unit_float, default=1.0, metavar='0.0-1.0',
                     help="scale the controller's pitch bend by this factor. default = 1")
+    ap.add_argument('--preserve-pressure', action='store_true',
+                    help="keep sending pressure to a channel after its note is released, until the channel is reused")
+    ap.add_argument('--preserve-timbre', action='store_true',
+                    help=f"keep sending timbre cc to a channel after its note is released, "
+                         "until the channel is reused")
     ap.add_argument('-v', '--verbose', action='store_true', help="print each channel assignment and just more stuff in general")
     args = ap.parse_args()
 
@@ -467,9 +480,11 @@ def main():
                 send_rpn(send, ch, 0, args.bend_range) 
 
         bend_range = args.bend_range or 48
+        preserve = ['aftertouch'] * args.preserve_pressure + [('cc', TIMBRE_CC)] * args.preserve_timbre
         dist = MpeDistributor(send, steal=not args.no_steal, verbose=args.verbose,
                               ji_limit=args.ji_limit if args.ji else None,
-                              ji_tolerance=args.ji_tolerance, bend_range=bend_range, pb_scale=args.pbscale)
+                              ji_tolerance=args.ji_tolerance, bend_range=bend_range, pb_scale=args.pbscale,
+                              preserve=preserve)
 
         for name in in_names:
             stack.enter_context(mido.open_input(
