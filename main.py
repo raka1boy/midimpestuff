@@ -161,6 +161,7 @@ class MpeDistributor:
         self.ji_cents = {}
         self.lingering = {}
         self.pressure = {}
+        self.attacking = set()
 
     def _log(self, text):
         if self.verbose:
@@ -208,7 +209,10 @@ class MpeDistributor:
     def _send_pressure(self, out_ch, value):
         prev = self.pressure.get(out_ch)
         if prev is not None:
-            value = prev * self.pressure_smoothing + value * (1 - self.pressure_smoothing)
+            if out_ch in self.attacking and value < prev:
+                self.attacking.discard(out_ch)
+            if out_ch not in self.attacking:
+                value = prev * self.pressure_smoothing + value * (1 - self.pressure_smoothing)
         self.pressure[out_ch] = value
         self.send(mido.Message('aftertouch', channel=out_ch, value=round(value)))
 
@@ -216,6 +220,7 @@ class MpeDistributor:
         state = self.in_state.get(source, {})
         self.send(self._bend_msg(out_ch, source))
         self.pressure.pop(out_ch, None)
+        self.attacking.add(out_ch)
         self._send_pressure(out_ch, state['aftertouch'].value if 'aftertouch' in state else 0)
         for key, msg in state.items():
             if key not in ('pitchwheel', 'aftertouch'):
@@ -320,6 +325,7 @@ class MpeDistributor:
             self.ji_cents.clear()
             self.lingering.clear()
             self.pressure.clear()
+            self.attacking.clear()
 
 def send_rpn(send, channel, rpn, msb, lsb=0):
     send(mido.Message('control_change', channel=channel, control=101, value=(rpn >> 7) & 0x7F))
@@ -497,7 +503,7 @@ def main():
     ap.add_argument('--preserve-pressure', type=unit_float, nargs='?', const=0.5, metavar='SMOOTHING',
                     help="keep sending pressure to a channel after its note is released, until the channel is reused. "
                          "pressure is smoothed by smoothing 0.0-1.0 and default = 0.5 so a lifted finger "
-                         "leaves the channel with a non-zero pressure. 0 = no smoothing")
+                         "leaves the channel with a non-zero pressure. smoothing starts once pressure first drops. 0 = no smoothing")
     ap.add_argument('--no-preserve-pressure', dest='preserve_pressure', action='store_const', const=None,
                     help="stop sending pressure to channels after their note is released")
     ap.add_argument('--preserve-timbre', action=argparse.BooleanOptionalAction, default=False,
