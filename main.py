@@ -33,6 +33,12 @@ JI_PER_STEP = 4
 JI_SLACK = 3.0
 JI_MAX_HEIGHT = 2 ** 24
 
+CHORD_KEYS = (('R', (0, 4, 7), (0, 4, 7, 11)),
+              ('F', (0, 3, 7), (0, 3, 7, 10)),
+              ('V', (0, 3, 6), (0, 3, 6, 9)))
+SEVENTH_KEY = 'E'
+INVERSION_KEYS = '123456789'
+
 
 def _odd_part(n):
     while n % 2 == 0:
@@ -140,10 +146,44 @@ def ji_tuning(pcs, bass, limit, tolerance=JI_TOLERANCE):
     return {pc: c - mean for pc, c in best_cents.items()}
 
 
+class KeyState:
+    def __init__(self):
+        if sys.platform == 'win32':
+            import ctypes
+            get = ctypes.windll.user32.GetAsyncKeyState
+            self.pressed = lambda key: bool(get(ord(key)) & 0x8000)
+            return
+        from pynput import keyboard
+        held = set()
+
+        def update(key, down):
+            char = getattr(key, 'char', None)
+            if char:
+                (held.add if down else held.discard)(char.upper())
+
+        keyboard.Listener(on_press=lambda k: update(k, True),
+                          on_release=lambda k: update(k, False)).start()
+        self.pressed = lambda key: key in held
+
+
+def chord_intervals(pressed):
+    for key, triad, seventh in CHORD_KEYS:
+        if pressed(key):
+            notes = list(seventh if pressed(SEVENTH_KEY) else triad)
+            break
+    else:
+        return None
+    for _ in range(max((int(k) for k in INVERSION_KEYS if pressed(k)), default=0)):
+        notes = notes[1:] + [notes[0] + 12]
+    return notes
+
+
 class MpeDistributor:
     def __init__(self, send, steal=True, verbose=False, ji_limit=None, ji_tolerance=JI_TOLERANCE,
-                 bend_range=48, pb_scale=1.0, preserve=(), pressure_smoothing=0.0, unipolar_timbre=False):
+                 bend_range=48, pb_scale=1.0, preserve=(), pressure_smoothing=0.0, unipolar_timbre=False,
+                 chord_for=None):
         self.send = send
+        self.chord_for = chord_for
         self.preserve = set(preserve)
         self.unipolar_timbre = unipolar_timbre
         self.pressure_smoothing = pressure_smoothing
@@ -179,26 +219,32 @@ class MpeDistributor:
             return None
 
         ch = min(self.channel_note, key=lambda c: self.channel_note[c][2])
-        source, note, _ = self.channel_note[ch]
+        source, note, _, key_note = self.channel_note[ch]
         self._log(f"steal ch{ch + 1} (note {note})")
         self.send(mido.Message('note_off', channel=ch, note=note, velocity=0))
-        self._release(source, note, ch)
+        self._release(source, key_note, ch)
         self.next_idx = (MEMBERS.index(ch) + 1) % n
         return ch
 
-    def _release(self, source, note, out_ch):
+    def _release(self, source, key_note, out_ch):
         self.channel_note.pop(out_ch, None)
         self.ji_cents.pop(out_ch, None)
         if self.preserve:
             self.lingering[out_ch] = source
-        stack = self.note_channels.get((source, note))
-        if stack and out_ch in stack:
-            stack.remove(out_ch)
-            if not stack:
-                del self.note_channels[(source, note)]
+        groups = self.note_channels.get((source, key_note))
+        if not groups:
+            return
+        for group in groups:
+            if out_ch in group:
+                group.remove(out_ch)
+                if not group:
+                    groups.remove(group)
+                break
+        if not groups:
+            del self.note_channels[(source, key_note)]
 
     def _out_channels_for(self, source):
-        return [c for c, (s, _, _) in self.channel_note.items() if s == source]
+        return [c for c, (s, *_) in self.channel_note.items() if s == source]
 
     def _bend_msg(self, out_ch, source):
         msg = self.in_state.get(source, {}).get('pitchwheel')
@@ -226,9 +272,9 @@ class MpeDistributor:
             if key not in ('pitchwheel', 'aftertouch'):
                 self.send(msg.copy(channel=out_ch))
 
-    def _retune(self, new_ch):
+    def _retune(self, new_chs):
 
-        held = {ch: note for ch, (_, note, _) in self.channel_note.items()}
+        held = {ch: note for ch, (_, note, *_) in self.channel_note.items()}
         if len(held) < 2:
             return
         tuning = ji_tuning(frozenset(n % 12 for n in held.values()),
@@ -237,7 +283,7 @@ class MpeDistributor:
             cents = tuning[note % 12]
             changed = self.ji_cents.get(ch) != cents
             self.ji_cents[ch] = cents
-            if changed and ch != new_ch:
+            if changed and ch not in new_chs:
                 self.send(self._bend_msg(ch, self.channel_note[ch][0]))
         self._log("ji:" + ", ".join(f"{note} {self.ji_cents[ch]:+.1f}c"
                                      for ch, note in sorted(held.items(), key=lambda x: x[1])))
@@ -256,36 +302,49 @@ class MpeDistributor:
         t = msg.type
 
         if self.unipolar_timbre and t == 'control_change' and msg.control == TIMBRE_CC:
-            msg = msg.copy(value=min(127, abs(msg.value - 64) * 2))
+            msg = msg.copy(value=min(127, abs(msg.value - 64)))
 
         if t == 'note_on' and msg.velocity > 0:
-            out_ch = self._allocate()
-            if out_ch is None:
-                self._log(f"drop note {msg.note}, no free channel")
+            intervals = (self.chord_for() if self.chord_for else None) or [0]
+            group, now = [], time.monotonic()
+            for note in (msg.note + i for i in intervals):
+                if not 0 <= note <= 127:
+                    continue
+                out_ch = self._allocate()
+                if out_ch is None:
+                    self._log(f"drop note {note}, no free channel")
+                    break
+                self.lingering.pop(out_ch, None)
+                self.channel_note[out_ch] = (source, note, now, msg.note)
+                group.append(out_ch)
+            if not group:
                 return
-            self.lingering.pop(out_ch, None)
-            self.channel_note[out_ch] = (source, msg.note, time.monotonic())
-            self.note_channels.setdefault((source, msg.note), []).append(out_ch)
+            self.note_channels.setdefault((source, msg.note), []).append(group)
             if self.ji_limit:
-                self._retune(out_ch)
-            self._prime_channel(out_ch, source)
-            self.send(msg.copy(channel=out_ch))
-            self._log(f"{port or 'in'} ch{in_ch + 1} note {msg.note} -> out ch{out_ch + 1}")
+                self._retune(group)
+            for out_ch in group:
+                self._prime_channel(out_ch, source)
+                self.send(msg.copy(channel=out_ch, note=self.channel_note[out_ch][1]))
+            self._log(f"{port or 'in'} ch{in_ch + 1} note {msg.note} -> " + ", ".join(
+                f"{self.channel_note[c][1]} out ch{c + 1}" for c in group))
             return
 
         if t == 'note_off' or (t == 'note_on' and msg.velocity == 0):
-            stack = self.note_channels.get((source, msg.note))
-            if not stack:
+            groups = self.note_channels.get((source, msg.note))
+            if not groups:
                 return
-            out_ch = stack[0]
-            self.send(msg.copy(channel=out_ch))
-            self._release(source, msg.note, out_ch)
-            self._log(f"{port or 'in'} ch{in_ch + 1} note {msg.note} off (out ch{out_ch + 1})")
+            group = list(groups[0])
+            for out_ch in group:
+                self.send(msg.copy(channel=out_ch, note=self.channel_note[out_ch][1]))
+                self._release(source, msg.note, out_ch)
+            self._log(f"{port or 'in'} ch{in_ch + 1} note {msg.note} off (out "
+                      + ", ".join(f"ch{c + 1}" for c in group) + ")")
             return
 
         if t == 'polytouch':
-            for out_ch in self.note_channels.get((source, msg.note), []):
-                self._send_pressure(out_ch, msg.value)
+            for group in self.note_channels.get((source, msg.note), []):
+                for out_ch in group:
+                    self._send_pressure(out_ch, msg.value)
             return
 
         if in_ch == MASTER:
@@ -318,7 +377,7 @@ class MpeDistributor:
 
     def all_notes_off(self):
         with self.lock:
-            for out_ch, (_, note, _) in list(self.channel_note.items()):
+            for out_ch, (_, note, *_) in list(self.channel_note.items()):
                 self.send(mido.Message('note_off', channel=out_ch, note=note, velocity=0))
             self.channel_note.clear()
             self.note_channels.clear()
@@ -546,6 +605,12 @@ def main():
             for ch in MEMBERS:
                 send_rpn(send, ch, 0, args.bend_range) 
 
+        try:
+            chord_for = functools.partial(chord_intervals, KeyState().pressed)
+        except ImportError:
+            chord_for = None
+            print("chord keys need pynput on this platform, run pip install pynput. continuing without them")
+
         bend_range = args.bend_range or 48
         preserve_pressure = args.preserve_pressure is not None
         preserve = ['aftertouch'] * preserve_pressure + [('cc', TIMBRE_CC)] * args.preserve_timbre
@@ -554,7 +619,7 @@ def main():
                               ji_tolerance=args.ji_tolerance, bend_range=bend_range, pb_scale=args.pbscale,
                               preserve=preserve,
                               pressure_smoothing=args.preserve_pressure if preserve_pressure else 0.0,
-                              unipolar_timbre=args.unipolar_timbre)
+                              unipolar_timbre=args.unipolar_timbre, chord_for=chord_for)
 
         for name in in_names:
             stack.enter_context(mido.open_input(

@@ -44,6 +44,7 @@ A non mpe controllers are also supported for ji.
 
 --unipolar-timbre makes timbre positive-only. the distance from the centre (64) in either direction is scaled to 0–127 so the centre sends 0
 
+
 -v, --verbose prints channel assignments, js tunings and just stuff in general
 
 with --ji every time a note starts the tool finds a just tuning for all the notes being held and retunes them with per-note pitch bend.
@@ -52,3 +53,10 @@ for each interval it chooses the simplest ratios (fewest and smallest prime fact
 when two tunings are equally simple, it prefers the one built on the lowest note
 the tuning is centred so that the average offset is 0 cents, which stops chords drifting away from concert pitch
 
+chord keys: hold computer keys while playing to turn each note into a chord with the played note as the root. the keys are read when the note starts and work even when the terminal isn't focused (on windows; other platforms need pip install pynput)
+
+R is major triad
+F is minor triad
+V is diminished triad
+1-9 together with a chord key plays its n-th inversion
+E + key is turns a chord into its seventh.
