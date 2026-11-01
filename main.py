@@ -143,10 +143,11 @@ def ji_tuning(pcs, bass, limit, tolerance=JI_TOLERANCE):
 class MpeDistributor:
     def __init__(self, send, steal=True, verbose=False, ji_limit=None, ji_tolerance=JI_TOLERANCE,
                  bend_range=48, pb_scale=1.0, preserve=(), pressure_smoothing=0.0, pressure_avg=0.0,
-                 unipolar_timbre=False):
+                 unipolar_timbre=False, pressure_as_velocity=False):
         self.send = send
         self.preserve = set(preserve)
         self.unipolar_timbre = unipolar_timbre
+        self.pressure_as_velocity = pressure_as_velocity
         self.pressure_smoothing = pressure_smoothing
         self.pressure_avg = pressure_avg
         self.steal = steal
@@ -165,6 +166,7 @@ class MpeDistributor:
         self.pressure = {}
         self.raw_pressure = {}
         self.attacking = set()
+        self.velocity = {}
 
     def _log(self, text):
         if self.verbose:
@@ -192,6 +194,7 @@ class MpeDistributor:
     def _release(self, source, note, out_ch):
         self.channel_note.pop(out_ch, None)
         self.ji_cents.pop(out_ch, None)
+        self.velocity.pop(out_ch, None)
         if self.preserve:
             self.lingering[out_ch] = source
         stack = self.note_channels.get((source, note))
@@ -220,6 +223,12 @@ class MpeDistributor:
                 value = prev * self.pressure_smoothing + value * (1 - self.pressure_smoothing)
         self.pressure[out_ch] = value
         self.send(mido.Message('aftertouch', channel=out_ch, value=round(value)))
+        if self.pressure_as_velocity and out_ch in self.velocity:
+            velocity = max(1, round(value))
+            if velocity != self.velocity[out_ch]:
+                self.velocity[out_ch] = velocity
+                self.send(mido.Message('note_on', channel=out_ch,
+                                       note=self.channel_note[out_ch][1], velocity=velocity))
 
     def _set_pressure(self, out_ch, value):
         self.raw_pressure[out_ch] = value
@@ -291,6 +300,7 @@ class MpeDistributor:
                 self._retune(out_ch)
             self._prime_channel(out_ch, source)
             self.send(msg.copy(channel=out_ch))
+            self.velocity[out_ch] = msg.velocity
             self._log(f"{port or 'in'} ch{in_ch + 1} note {msg.note} -> out ch{out_ch + 1}")
             return
 
@@ -348,6 +358,7 @@ class MpeDistributor:
             self.pressure.clear()
             self.raw_pressure.clear()
             self.attacking.clear()
+            self.velocity.clear()
 
 def send_rpn(send, channel, rpn, msb, lsb=0):
     send(mido.Message('control_change', channel=channel, control=101, value=(rpn >> 7) & 0x7F))
@@ -537,6 +548,9 @@ def main():
     ap.add_argument('--unipolar-timbre', action=argparse.BooleanOptionalAction, default=False,
                     help="make timbre cc positive-only. distance from the centre =64 in either direction "
                          "is scaled to 0-127, so the centre sends 0")
+    ap.add_argument('--pressure-as-velocity', action=argparse.BooleanOptionalAction, default=False,
+                    help="while a note is held, re-send its note on with the current pressure as velocity "
+                         "every time the pressure changes. aftertouch is still sent too")
     ap.add_argument('-v', '--verbose', action=argparse.BooleanOptionalAction, default=False,
                     help="print each channel assignment and just more stuff in general")
 
@@ -580,7 +594,8 @@ def main():
                               preserve=preserve,
                               pressure_smoothing=args.preserve_pressure if preserve_pressure else 0.0,
                               pressure_avg=args.pressure_avg,
-                              unipolar_timbre=args.unipolar_timbre)
+                              unipolar_timbre=args.unipolar_timbre,
+                              pressure_as_velocity=args.pressure_as_velocity)
 
         for name in in_names:
             stack.enter_context(mido.open_input(
